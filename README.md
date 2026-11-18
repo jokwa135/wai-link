@@ -84,7 +84,7 @@ The build downloads scrcpy and Python, installs the pinned packages from `iphone
 - **[jokwa135](https://github.com/jokwa135)**: creator; design, direction and testing.
 - **Claude** (Anthropic): iOS 27 hardware video and sound, bridge recovery, the glass shell and rotation,
   the portable layout and build.
-- **Argon** (Gemini): the iPhone bridge (`iphone/bridge/wda_hid_bridge.py`) and the pymobiledevice3
+- **Gemini** (Google, as the Argon agent): the iPhone bridge (`iphone/bridge/wda_hid_bridge.py`) and the pymobiledevice3
   Wi-Fi tunnel and touch-input changes (`iphone/patches`).
 - **Codex** (OpenAI): development work on WAI Link.
 - **Hermes**: development sessions on WAI Link.
