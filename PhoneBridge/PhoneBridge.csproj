@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>WAI Link</AssemblyName>
+    <RootNamespace>PhoneBridge</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <NoWarn>$(NoWarn);WFO1000</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WAILink.Android\WAILink.Android.csproj" />
+    <ProjectReference Include="..\WAILink.Apple\WAILink.Apple.csproj" />
+    <ProjectReference Include="..\WAILink.Agent\WAILink.Agent.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\Icons\*.png" />
+    <EmbeddedResource Include="Assets\Brand\*" />
+    <EmbeddedResource Include="Assets\Logo3D\*.png" />
+    <!-- iPhone side: bridge scripts, WebDriverAgent and the setup helper. lib\ (scrcpy, adb) and
+         iphone\python\ (bundled Python) are added by scripts\build.ps1. -->
+    <Content Include="..\iphone\bridge\*.py" Link="iphone\bridge\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\iphone\WebDriverAgentRunner.ipa;..\iphone\Setup-iPhone.cmd" Link="iphone\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

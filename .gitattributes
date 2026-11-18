@@ -1,0 +1,6 @@
+# Patches must keep the exact line endings of the files they change.
+*.patch -text
+# Binary assets
+*.ipa binary
+*.png binary
+*.ico binary

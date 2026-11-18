@@ -1,0 +1,566 @@
+# WAI Link's changes to pymobiledevice3 11.50.3: faster Wi-Fi tunnel setup (direct host, TCP_NODELAY),
+# DTX connection tweaks, and touch/button input read from stdin by the XCUITest runner.
+# Applied by scripts/build.ps1 from site-packages with: git apply -p1
+diff --git a/pymobiledevice3/cli/cli_common.py b/pymobiledevice3/cli/cli_common.py
+index b2b3cf5..1eff8de 100644
+--- a/pymobiledevice3/cli/cli_common.py
++++ b/pymobiledevice3/cli/cli_common.py
+@@ -620,7 +620,7 @@ def make_rsd_dependency(*, allow_none: bool) -> Callable[..., Optional[RemoteSer
+ 
+             try:
+                 return cli_loop.run_until_complete(
+-                    userspace_tunnel.establish_userspace_rsd(serial=serial, remotepairing_fallback=False)
++                    userspace_tunnel.establish_userspace_rsd(serial=serial, remotepairing_fallback=True)
+                 )
+             except UserspaceTunnelUnavailableError:
+                 # The userspace path can't serve this device (iOS 17.0-17.3 has no CoreDeviceProxy).
+diff --git a/pymobiledevice3/dtx/connection.py b/pymobiledevice3/dtx/connection.py
+index c04d7ed..3c390cb 100644
+--- a/pymobiledevice3/dtx/connection.py
++++ b/pymobiledevice3/dtx/connection.py
+@@ -558,6 +558,6 @@ class DTXConnection(_DTXSenderMixin, _DTXReaderMixin):
+             return
+         await self._control_svc.notify_capabilities(self.sent_capabilities)
+         try:
+-            await asyncio.wait_for(asyncio.shield(self._handshake_done), timeout=15.0)
++            await asyncio.wait_for(asyncio.shield(self._handshake_done), timeout=2.0)
+         except asyncio.TimeoutError as exc:
+             raise ConnectionError("DTX capability handshake timed out") from exc
+diff --git a/pymobiledevice3/dtx_service_provider.py b/pymobiledevice3/dtx_service_provider.py
+index c5bc8ed..1f197c6 100644
+--- a/pymobiledevice3/dtx_service_provider.py
++++ b/pymobiledevice3/dtx_service_provider.py
+@@ -153,16 +153,21 @@ class DtxServiceProvider:
+         """
+         if self._dtx is not None:
+             return
+-        dtx = await self._open_dtx_connection(self._service_name, strip_ssl=self._strip_ssl)
+-        dtx.sent_capabilities = self.sent_capabilities
+-        try:
+-            await dtx.connect()
+-            if self.REGISTER_SERVICES:
+-                dtx.register_services(*self.REGISTER_SERVICES)
+-            self._dtx = dtx
+-        except Exception:
+-            await dtx.aclose()
+-            raise
++        last_exc: Optional[Exception] = None
++        for _ in range(3):
++            dtx = await self._open_dtx_connection(self._service_name, strip_ssl=self._strip_ssl)
++            dtx.sent_capabilities = self.sent_capabilities
++            try:
++                await dtx.connect()
++                if self.REGISTER_SERVICES:
++                    dtx.register_services(*self.REGISTER_SERVICES)
++                self._dtx = dtx
++                return
++            except Exception as exc:
++                last_exc = exc
++                await dtx.aclose()
++        if last_exc is not None:
++            raise last_exc
+ 
+     async def close(self) -> None:
+         """Close the :class:`DTXConnection` if this provider owns it."""
+diff --git a/pymobiledevice3/remote/tunnel_service.py b/pymobiledevice3/remote/tunnel_service.py
+index daca8c9..6db49b8 100644
+--- a/pymobiledevice3/remote/tunnel_service.py
++++ b/pymobiledevice3/remote/tunnel_service.py
+@@ -19,6 +19,7 @@ from asyncio import CancelledError, StreamReader, StreamWriter
+ from collections.abc import AsyncGenerator, Awaitable, Collection, Mapping
+ from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+ from pathlib import Path
++import socket
+ from socket import create_connection
+ from ssl import VerifyMode
+ from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, Optional, TextIO, Union, cast
+@@ -793,6 +794,8 @@ class RemotePairingProtocol(StartTcpTunnel):
+         host = self.hostname
+         port = parameters["port"]
+         sock = create_connection((host, port))
++        with suppress(OSError):
++            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+         OSUTIL.set_keepalive(sock)
+         if sys.version_info >= (3, 13):
+             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+@@ -1679,6 +1682,22 @@ async def get_remote_pairing_tunnel_services(
+         return []
+ 
+     result: list[RemotePairingTunnelService] = []
++    direct_host = os.environ.get("WDA_WIFI_HOST", "").strip()
++    if direct_host:
++        for identifier in alt_irks:
++            try:
++                result.append(
++                    await create_core_device_tunnel_service_using_remotepairing(
++                        identifier, direct_host, 49152
++                    )
++                )
++                if udid is not None and result:
++                    return result
++            except (ConnectionTerminatedError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError, ValueError) as e:
++                logger.debug("Direct remote pairing %s@%s:49152 failed: %r", identifier, direct_host, e)
++        if result:
++            return result
++
+     # Asking for one device stops at it; listing them all still takes the whole window.
+     answers = iter_browse_remotepairing(timeout=bonjour_timeout)
+     try:
+@@ -1686,14 +1705,15 @@ async def get_remote_pairing_tunnel_services(
+             identifier = _match_remote_pair_record(answer, alt_irks)
+             if identifier is None:
+                 continue
+-            for address in answer.addresses:
++            for address in sorted(answer.addresses, key=lambda a: ":" in a.ip):
+                 try:
+                     result.append(
+                         await create_core_device_tunnel_service_using_remotepairing(
+                             identifier, address.full_ip, answer.port
+                         )
+                     )
+-                except (ConnectionTerminatedError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError) as e:
++                    break
++                except (ConnectionTerminatedError, asyncio.IncompleteReadError, asyncio.TimeoutError, OSError, ValueError) as e:
+                     logger.debug(
+                         "Skipping remote pairing service %s@%s:%s: %r", identifier, address.full_ip, answer.port, e
+                     )
+diff --git a/pymobiledevice3/remote/userspace_tunnel.py b/pymobiledevice3/remote/userspace_tunnel.py
+index 88ae7c0..530c863 100644
+--- a/pymobiledevice3/remote/userspace_tunnel.py
++++ b/pymobiledevice3/remote/userspace_tunnel.py
+@@ -612,6 +612,9 @@ class UserspaceDialPlane:
+             if self._closing:
+                 raise ConnectionError("userspace dial plane is closed")
+             client, relay = socket.socketpair()
++            for s in (client, relay):
++                with suppress(OSError):
++                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+             _grow_relay_buffers(client)
+             _grow_relay_buffers(relay)
+             writer: Optional[asyncio.StreamWriter] = None
+@@ -716,29 +719,54 @@ async def _create_no_root_tunnel_provider(serial: Optional[str], autopair: bool,
+     devices elsewhere, e.g. a kernel tunnel). Either way, a device that cannot be served no-root
+     raises :class:`UserspaceTunnelUnavailableError`.
+     """
+-    lockdown = await create_using_usbmux(serial=serial, autopair=autopair)
++    # Prefer Wi-Fi RemotePairing tunnel first whenever a RemotePairing record already exists,
++    # so unplugging the USB cable never interrupts the active developer tunnel or kills WDA.
+     try:
++        from pymobiledevice3.pair_records import iter_remote_pair_records_by_identifier
++
++        existing_ids = {i for i, _, _ in iter_remote_pair_records_by_identifier()}
++        if existing_ids and (serial is None or serial in existing_ids):
++            wifi_services = await tunnel_service.get_remote_pairing_tunnel_services(
++                udid=serial or next(iter(existing_ids))
++            )
++            if wifi_services:
++                logger.info("Connected userspace tunnel over Wi-Fi RemotePairing")
++                return wifi_services[0], None
++    except Exception:
++        pass
++
++    lockdown = None
++    try:
++        lockdown = await create_using_usbmux(serial=serial, autopair=autopair)
++        try:
++            from pymobiledevice3.pair_records import iter_remote_pair_records_by_identifier
++
++            existing_ids = {i for i, _, _ in iter_remote_pair_records_by_identifier()}
++            if lockdown.udid and lockdown.udid not in existing_ids:
++                rp_svc = await tunnel_service.RemotePairingLockdownService.create(lockdown)
++                try:
++                    await rp_svc.connect(autopair=True)
++                except Exception:
++                    pass
++                finally:
++                    with suppress(Exception):
++                        await rp_svc.close()
++        except Exception:
++            pass
+         return await tunnel_service.CoreDeviceTunnelProxy.create(lockdown), lockdown
+-    except InvalidServiceError:
+-        # iOS < 17.4 has no CoreDeviceProxy lockdown service.
+-        await lockdown.close()
++    except Exception:
++        if lockdown is not None:
++            with suppress(Exception):
++                await lockdown.close()
+         if not remotepairing_fallback:
+             raise UserspaceTunnelUnavailableError(
+                 "No-root userspace tunnel unavailable: the device has no CoreDeviceProxy service "
+                 "(needs iOS 17.4+) and the RemotePairing fallback was disabled."
+             ) from None
+-        logger.info("CoreDeviceProxy unavailable (iOS < 17.4); falling back to RemotePairing over bonjour")
+-    except BaseException:
+-        await lockdown.close()
+-        raise
++        logger.info("USB CoreDeviceProxy unavailable; falling back to RemotePairing over bonjour")
+ 
+-    # Ask for the device we just handshook with over USB, not for whoever answers first. The
+-    # handshake names it even when the caller did not (``serial`` is None for a single attached
+-    # device), and without a name every paired device on the network is contacted: ``services[0]``
+-    # could then be a different phone than the command targeted, while the rest are built and never
+-    # closed. Naming it also lets the browse stop at the first match instead of running to the
+-    # bonjour timeout.
+-    services = await tunnel_service.get_remote_pairing_tunnel_services(udid=serial or lockdown.udid)
++    target_udid = serial or (lockdown.udid if lockdown is not None else None)
++    services = await tunnel_service.get_remote_pairing_tunnel_services(udid=target_udid)
+     if not services:
+         raise UserspaceTunnelUnavailableError(
+             "No-root userspace tunnel unavailable: the device exposes no CoreDeviceProxy lockdown "
+diff --git a/pymobiledevice3/services/dvt/testmanaged/dtx_services.py b/pymobiledevice3/services/dvt/testmanaged/dtx_services.py
+index d5b596f..e110106 100644
+--- a/pymobiledevice3/services/dvt/testmanaged/dtx_services.py
++++ b/pymobiledevice3/services/dvt/testmanaged/dtx_services.py
+@@ -301,6 +301,9 @@ class XCTestManager_IDEInterface(DTXService):
+     @dtx_on_invoke
+     async def _XCT_testCaseDidStartForTestClass_method_(self, test_class: str, method: str) -> None:
+         logger.info("[IDE] testCaseDidStart: %s/%s", test_class, method)
++        ev: Optional[asyncio.Event] = self._ctx.get("case_started_event")
++        if ev is not None:
++            ev.set()
+         li = self._listener()
+         if li is not None:
+             await li.test_case_did_start(test_class, method)
+@@ -370,14 +373,20 @@ class XCTestManager_IDEInterface(DTXService):
+ 
+     @dtx_on_invoke
+     async def _XCT_initializationForUITestingDidFailWithError_(self, error: NSError) -> None:
+-        logger.error("[IDE] initializationForUITestingDidFailWithError: %s", error)
++        logger.error("[IDE] initializationForUITestingDidFailWithError: %s (%r)", error, getattr(error, "__dict__", error))
++        ev: Optional[asyncio.Event] = self._ctx.get("test_done_event")
++        if ev is not None:
++            ev.set()
+         li = self._listener()
+         if li is not None:
+             await li.initialization_for_ui_testing_did_fail(error)
+ 
+     @dtx_on_invoke
+     async def _XCT_didFailToBootstrapWithError_(self, error: NSError) -> None:
+-        logger.error("[IDE] didFailToBootstrapWithError: %s", error)
++        logger.error("[IDE] didFailToBootstrapWithError: %s (%r)", error, getattr(error, "__dict__", error))
++        ev: Optional[asyncio.Event] = self._ctx.get("test_done_event")
++        if ev is not None:
++            ev.set()
+         li = self._listener()
+         if li is not None:
+             await li.did_fail_to_bootstrap(error)
+@@ -458,6 +467,9 @@ class XCTestManager_IDEInterface(DTXService):
+         test_class = identifier.test_class
+         method = identifier.test_method or ""
+         logger.info("[IDE] testCaseDidStart: %s/%s (iter=%d)", test_class, method, config.iteration)
++        ev: Optional[asyncio.Event] = self._ctx.get("case_started_event")
++        if ev is not None:
++            ev.set()
+         li = self._listener()
+         if li is not None:
+             await li.test_case_did_start(test_class, method)
+diff --git a/pymobiledevice3/services/dvt/testmanaged/xctest_types.py b/pymobiledevice3/services/dvt/testmanaged/xctest_types.py
+index 85ec586..3b18da6 100644
+--- a/pymobiledevice3/services/dvt/testmanaged/xctest_types.py
++++ b/pymobiledevice3/services/dvt/testmanaged/xctest_types.py
+@@ -57,7 +57,7 @@ class XCTestConfiguration:
+         "baselineFileRelativePath": None,
+         "baselineFileURL": None,
+         "defaultTestExecutionTimeAllowance": None,
+-        "disablePerformanceMetrics": False,
++        "disablePerformanceMetrics": True,
+         "emitOSLogs": False,
+         "formatVersion": plistlib.UID(2),
+         "gatherLocalizableStringsData": False,
+@@ -65,7 +65,7 @@ class XCTestConfiguration:
+         "maximumTestExecutionTimeAllowance": None,
+         "productModuleName": "WebDriverAgentRunner",
+         "randomExecutionOrderingSeed": None,
+-        "reportActivities": True,
++        "reportActivities": False,
+         "reportResultsToIDE": True,
+         "systemAttachmentLifetime": 2,
+         "targetApplicationArguments": [],
+diff --git a/pymobiledevice3/services/dvt/testmanaged/xcuitest.py b/pymobiledevice3/services/dvt/testmanaged/xcuitest.py
+index cc029b4..6465ae9 100644
+--- a/pymobiledevice3/services/dvt/testmanaged/xcuitest.py
++++ b/pymobiledevice3/services/dvt/testmanaged/xcuitest.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import sys
+ from contextlib import suppress
+ from dataclasses import dataclass
+ from typing import Any, Optional, cast
+@@ -27,7 +28,17 @@ from pymobiledevice3.dtx_service import DtxService
+ from pymobiledevice3.dtx_service_provider import DtxServiceProvider
+ from pymobiledevice3.exceptions import AppNotInstalledError, ConnectionTerminatedError
+ from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
++from pymobiledevice3.remote.core_device.hid_service import (
++    HID_BUTTON_STATE_DOWN,
++    HID_BUTTON_STATE_UP,
++    TOUCHSCREEN_STATE_CONTACT,
++    TOUCHSCREEN_STATE_RELEASE,
++    IndigoHIDService,
++    UniversalHIDServiceService,
++)
++from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
+ from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider as InstrumentsDvtProvider
++from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
+ from pymobiledevice3.services.dvt.testmanaged.dtx_services import (  # noqa: F401 — re-exported
+     ProcessControlService,
+     XCTestCaseResult,
+@@ -116,6 +127,178 @@ class XCUITestService:
+     # Public API
+     # ------------------------------------------------------------------
+ 
++    async def _reset_stale_testmanager_daemons(self) -> None:
++        with suppress(Exception):
++            async with InstrumentsDvtProvider(self.lockdown) as dvt:
++                async with DeviceInfo(dvt) as dev_info, ProcessControl(dvt) as proc_ctrl:
++                    procs = await dev_info.proclist()
++                    killed = False
++                    for p in procs:
++                        name = p.get("name", "")
++                        if name in ("testmanagerd", "WebDriverAgentRunner-Runner"):
++                            with suppress(Exception):
++                                await proc_ctrl.kill(p["pid"])
++                                killed = True
++                    if killed:
++                        await asyncio.sleep(0.35)
++
++    async def _stdin_hid_loop(
++        self,
++        test_done: asyncio.Event,
++        case_started: asyncio.Event,
++    ) -> None:
++        if not hasattr(self.lockdown, "service"):
++            return
++        with suppress(asyncio.CancelledError, Exception):
++            await case_started.wait()
++            if test_done.is_set():
++                return
++
++            async with UniversalHIDServiceService(self.lockdown) as uhid, IndigoHIDService(self.lockdown) as ihid:
++                sys.stdout.write("HID_BRIDGE_READY\n")
++                sys.stdout.flush()
++
++                loop = asyncio.get_running_loop()
++                cur_x, cur_y = 32768, 32768
++                start_x, start_y = 32768, 32768
++                last_dx, last_dy = 0, 0
++                move_count = 0
++                is_down = False
++
++                while not test_done.is_set():
++                    line = await loop.run_in_executor(None, sys.stdin.readline)
++                    if not line:
++                        break
++                    parts = line.strip().split()
++                    if not parts:
++                        continue
++                    cmd = parts[0].upper()
++
++                    if cmd == "DOWN" and len(parts) >= 3:
++                        x = max(0, min(65535, int(parts[1])))
++                        y = max(0, min(65535, int(parts[2])))
++                        cur_x, cur_y = x, y
++                        start_x, start_y = x, y
++                        last_dx, last_dy = 0, 0
++                        move_count = 0
++                        is_down = True
++                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++
++                    elif cmd == "MOVE" and len(parts) >= 3:
++                        x = max(0, min(65535, int(parts[1])))
++                        y = max(0, min(65535, int(parts[2])))
++                        if not is_down:
++                            cur_x, cur_y = x, y
++                            start_x, start_y = x, y
++                            last_dx, last_dy = 0, 0
++                            move_count = 0
++                            is_down = True
++                            await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                        else:
++                            dx = x - cur_x
++                            dy = y - cur_y
++                            if dx == 0 and dy == 0:
++                                continue
++                            last_dx, last_dy = dx, dy
++                            move_count += 1
++                            dist = max(abs(dx), abs(dy))
++                            if move_count == 1 or dist > 3500:
++                                mx = int(cur_x + dx * 0.5)
++                                my = int(cur_y + dy * 0.5)
++                                await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, mx, my)
++                                await asyncio.sleep(0.004)
++                            cur_x, cur_y = x, y
++                            await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++
++                    elif cmd == "UP" and len(parts) >= 3:
++                        x = max(0, min(65535, int(parts[1])))
++                        y = max(0, min(65535, int(parts[2])))
++                        brake = int(parts[3]) if len(parts) > 3 else 1
++                        if is_down:
++                            if x != cur_x or y != cur_y:
++                                last_dx = x - cur_x
++                                last_dy = y - cur_y
++                                cur_x, cur_y = x, y
++                                await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                            total_dx = cur_x - start_x
++                            total_dy = cur_y - start_y
++                            if brake == 1:
++                                sx = 180 if total_dx > 250 else (-180 if total_dx < -250 else 0)
++                                sy = 180 if total_dy > 250 else (-180 if total_dy < -250 else 0)
++                                if sx != 0 or sy != 0:
++                                    for _ in range(4):
++                                        await asyncio.sleep(0.020)
++                                        cur_x = max(0, min(65535, cur_x + sx))
++                                        cur_y = max(0, min(65535, cur_y + sy))
++                                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                            else:
++                                if abs(total_dx) > abs(total_dy) and abs(total_dx) > 1000:
++                                    bx = 2200 if total_dx > 0 else -2200
++                                    for _ in range(3):
++                                        await asyncio.sleep(0.008)
++                                        cur_x = max(0, min(65535, cur_x + bx))
++                                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                            await uhid.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, cur_x, cur_y)
++                            is_down = False
++
++                    elif cmd == "TAP" and len(parts) >= 3:
++                        x = max(0, min(65535, int(parts[1])))
++                        y = max(0, min(65535, int(parts[2])))
++                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, x, y)
++                        await asyncio.sleep(0.045)
++                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, x, y)
++                        is_down = False
++
++                    elif cmd == "SWIPE" and len(parts) >= 5:
++                        x1 = max(0, min(65535, int(parts[1])))
++                        y1 = max(0, min(65535, int(parts[2])))
++                        x2 = max(0, min(65535, int(parts[3])))
++                        y2 = max(0, min(65535, int(parts[4])))
++                        brake = int(parts[5]) if len(parts) > 5 else 1
++                        steps = 14
++                        for i in range(steps + 1):
++                            t = i / steps
++                            cx = int(x1 + (x2 - x1) * t)
++                            cy = int(y1 + (y2 - y1) * t)
++                            await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cx, cy)
++                            await asyncio.sleep(0.012)
++                        cur_x, cur_y = x2, y2
++                        if brake == 1:
++                            sx = 180 if (x2 - x1) > 250 else (-180 if (x2 - x1) < -250 else 0)
++                            sy = 180 if (y2 - y1) > 250 else (-180 if (y2 - y1) < -250 else 0)
++                            if sx != 0 or sy != 0:
++                                for _ in range(4):
++                                    await asyncio.sleep(0.020)
++                                    cur_x = max(0, min(65535, cur_x + sx))
++                                    cur_y = max(0, min(65535, cur_y + sy))
++                                    await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                        else:
++                            if abs(x2 - x1) > abs(y2 - y1):
++                                bx = 2200 if (x2 - x1) > 0 else -2200
++                                for _ in range(3):
++                                    await asyncio.sleep(0.008)
++                                    cur_x = max(0, min(65535, cur_x + bx))
++                                    await uhid.send_touchscreen(TOUCHSCREEN_STATE_CONTACT, cur_x, cur_y)
++                        await uhid.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, cur_x, cur_y)
++                        is_down = False
++
++                    elif cmd == "BTN" and len(parts) >= 2:
++                        bname = parts[1].lower()
++                        usage = 0x40
++                        if bname == "lock":
++                            usage = 0x30
++                        elif bname == "volup":
++                            usage = 0xE9
++                        elif bname == "voldown":
++                            usage = 0xEA
++                        await ihid.send_button(0x0C, usage, HID_BUTTON_STATE_DOWN)
++                        await asyncio.sleep(0.05)
++                        await ihid.send_button(0x0C, usage, HID_BUTTON_STATE_UP)
++
++                    elif cmd == "QUIT":
++                        test_done.set()
++                        break
++
+     async def run(
+         self,
+         cfg: TestConfig,
+@@ -132,6 +315,9 @@ class XCUITestService:
+             lifecycle events (test suite/case start/finish, failures, etc.).
+         """
+         test_done = test_done_event or asyncio.Event()
++        case_started = asyncio.Event()
++
++        await self._reset_stale_testmanager_daemons()
+ 
+         sid = NSUUID.uuid4()
+         xctest_config = cfg.to_xctestconfiguration(sid, self.lockdown)
+@@ -150,6 +336,7 @@ class XCUITestService:
+             for tm_prov in (control_test_manager_provider, main_test_manager_provider):
+                 tm_prov.dtx.ctx["xctest_config"] = xctest_config
+                 tm_prov.dtx.ctx["test_done_event"] = test_done
++                tm_prov.dtx.ctx["case_started_event"] = case_started
+                 if listener is not None:
+                     tm_prov.dtx.ctx["xcuitest_listener"] = listener
+ 
+@@ -201,6 +388,11 @@ class XCUITestService:
+                     logger.debug("Starting test plan execution ...")
+                     await driver_iface.start_executing_test_plan(XCODE_VERSION)
+ 
++                    hid_task = asyncio.create_task(
++                        self._stdin_hid_loop(test_done, case_started),
++                        name="xcuitest-stdin-hid",
++                    )
++
+                     timeout_str = f"{timeout:.1f}s" if timeout is not None else "unlimited time"
+                     logger.debug("Waiting for test completion (timeout=%s) ...", timeout_str)
+ 
+@@ -221,10 +413,11 @@ class XCUITestService:
+                             return_when=asyncio.FIRST_COMPLETED,
+                         )
+                     finally:
++                        hid_task.cancel()
+                         done_fut.cancel()
+                         disc_fut.cancel()
+                         with suppress(asyncio.CancelledError, Exception):
+-                            await asyncio.gather(done_fut, disc_fut, return_exceptions=True)
++                            await asyncio.gather(hid_task, done_fut, disc_fut, return_exceptions=True)
+ 
+                     if not done_set:
+                         raise TimeoutError(f"Test did not finish within {timeout_str}")
+@@ -326,7 +519,8 @@ class TestConfig:
+             "testIdentifiersToSkip": tests_to_skip_ids,
+             "testsMustRunOnMainThread": True,
+             "reportResultsToIDE": True,
+-            "reportActivities": True,
++            "reportActivities": False,
++            "disablePerformanceMetrics": True,
+             "testApplicationDependencies": None,
+             **cfg,
+         })
+@@ -356,19 +550,18 @@ def _generate_launch_args(
+         "CA_DEBUG_TRANSACTIONS": "0",
+         "DYLD_FRAMEWORK_PATH": app_path + "/Frameworks:",
+         "DYLD_LIBRARY_PATH": app_path + "/Frameworks",
+-        "MTC_CRASH_ON_REPORT": "1",
+-        "NSUnbufferedIO": "YES",
+-        "SQLITE_ENABLE_THREAD_ASSERTIONS": "1",
++        "MTC_CRASH_ON_REPORT": "0",
++        "NSUnbufferedIO": "NO",
++        "SQLITE_ENABLE_THREAD_ASSERTIONS": "0",
+         "WDA_PRODUCT_BUNDLE_IDENTIFIER": "",
++        "MJPEG_SCALING_FACTOR": "35",
++        "MJPEG_SERVER_SCREENSHOT_QUALITY": "20",
+         "XCTestBundlePath": f"{app_path}/PlugIns/{target_name}.xctest",
+         "XCTestConfigurationFilePath": app_container + xctest_path,
+         "XCODE_DBG_XPC_EXCLUSIONS": "com.apple.dt.xctestSymbolicator",
+         "XCTestSessionIdentifier": str(test_session_identifier).upper(),
+     }
+ 
+-    if product_major_version >= 11:
+-        app_env["DYLD_INSERT_LIBRARIES"] = "/Developer/usr/lib/libMainThreadChecker.dylib"
+-        app_env["OS_ACTIVITY_DT_MODE"] = "YES"
+     if product_major_version >= 17:
+         app_env["DYLD_FRAMEWORK_PATH"] = f"${app_env['DYLD_FRAMEWORK_PATH']}/System/Developer/Library/Frameworks:"
+         app_env["DYLD_LIBRARY_PATH"] = f"${app_env['DYLD_LIBRARY_PATH']}:/System/Developer/usr/lib"

@@ -1,0 +1,15 @@
+# Build output: scripts/build.ps1 creates these.
+bin/
+obj/
+dist/
+release/
+.build/
+
+# Personal notes, backups and design-tool working files (never published).
+local/
+.impeccable/
+PRODUCT.md
+backup-*/
+
+*.user
+*.log

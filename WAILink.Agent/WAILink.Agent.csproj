@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>WAILink.Agent</AssemblyName>
+    <RootNamespace>PhoneBridge</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WAILink.Android\WAILink.Android.csproj" />
+    <ProjectReference Include="..\WAILink.Apple\WAILink.Apple.csproj" />
+  </ItemGroup>
+
+</Project>
