@@ -163,6 +163,10 @@ def supervised_input_loop(read_input):
                         # those samples do not belong to a continuous contact.
                         asyncio.run_coroutine_threadsafe(send_contact(parts[0], x, y), loop).result(4)
                         continue
+                    if len(parts) == 3 and parts[0] == "SCREEN":
+                        # Screen size in pixels, read by wda_video to trim frame padding.
+                        os.environ["WAILINK_SCREEN_PX"] = parts[1] + "x" + parts[2]
+                        continue
                     if line.strip() in ("VIDEO_OFF", "VIDEO_ON"):
                         asyncio.run_coroutine_threadsafe(set_video(line.strip() == "VIDEO_ON"), loop)
                         continue

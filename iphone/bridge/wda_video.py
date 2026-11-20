@@ -84,16 +84,110 @@ def _content_crop(frame):
     return None
 
 
+class PaddingTrim:
+    """The phone encodes its screen in a slightly larger frame (1242x2688 is sent as 1248x2704)
+    and fills the extra right columns and bottom rows with black, without marking them as
+    cropped. Cut it off, so the picture keeps the screen's real shape and fills the shell.
+    The screen's pixel size comes from WAI Link (SCREEN command, WAILINK_SCREEN_PX); until
+    it arrives, the black edge is looked for in the picture."""
+
+    BLACK, CONTENT = 24, 40  # luma: padding is limited-range black (16); real content rises above
+    MAX_PAD = 32
+
+    def __init__(self):
+        self._size = None  # coded frame size the decision below belongs to
+        self._box = None   # (width, height) to keep, once decided
+        self._graph = None
+        self._screen = None  # WAILINK_SCREEN_PX the decision was made with
+
+    @classmethod
+    def _known(cls, frame):
+        """Content box from the screen size WAI Link reported, or None."""
+        import os
+
+        try:
+            a, b = (int(v) for v in os.environ.get("WAILINK_SCREEN_PX", "").split("x"))
+        except ValueError:
+            return None
+        fw, fh = frame.width, frame.height
+        for sw, sh in ((a, b), (b, a)):
+            if 0 <= fw - sw <= cls.MAX_PAD and 0 <= fh - sh <= cls.MAX_PAD:
+                return sw // 2 * 2, sh // 2 * 2
+        return None
+
+    @classmethod
+    def _edge(cls, y, line, length, sample, column):
+        """Count black lines (columns or rows) at the far edge. None while undecided, which
+        happens when the screen itself is black there and the boundary can't be seen."""
+        def luma(line_index, i):
+            return y[i * line + line_index] if column else y[line_index * line + i]
+
+        def black(index):
+            return all(luma(index, i) <= cls.BLACK for i in sample)
+
+        pad = 0
+        while pad < cls.MAX_PAD and black(length - 1 - pad):
+            pad += 1
+        if pad == cls.MAX_PAD:
+            return None
+        inner = length - 1 - pad
+        return pad if any(luma(inner, i) > cls.CONTENT for i in sample) else None
+
+    def _decide(self, frame):
+        plane = frame.planes[0]
+        y, line = bytes(plane), plane.line_size
+        fw, fh = frame.width, frame.height
+        rows = range(fh // 40, fh - fh // 40, max(1, fh // 64))
+        cols = range(fw // 40, fw - fw // 40, max(1, fw // 64))
+        right = self._edge(y, line, fw, rows, column=True)
+        bottom = self._edge(y, line, fh, cols, column=False)
+        if right is None or bottom is None:
+            return None
+        return (fw - right) // 2 * 2, (fh - bottom) // 2 * 2
+
+    def apply(self, frame):
+        from fractions import Fraction
+        import av
+
+        import os
+
+        size = (frame.width, frame.height, frame.format.name)
+        screen = os.environ.get("WAILINK_SCREEN_PX")
+        if size != self._size or screen != self._screen:
+            self._size, self._screen, self._box, self._graph = size, screen, None, None
+        if self._box is None:
+            self._box = self._known(frame) or self._decide(frame)
+            if self._box is None:
+                return frame  # decide on a later frame
+        if self._box == (frame.width, frame.height):
+            return frame
+        if self._graph is None:
+            graph = av.filter.Graph()
+            source = graph.add_buffer(width=frame.width, height=frame.height,
+                                      format=frame.format.name, time_base=Fraction(1, 1000))
+            crop = graph.add("crop", "%d:%d:0:0" % self._box)
+            sink = graph.add("buffersink")
+            source.link_to(crop)
+            crop.link_to(sink)
+            graph.configure()
+            self._graph = graph
+        frame.pts = None
+        self._graph.vpush(frame)
+        return self._graph.vpull()
+
+
 class JpegEncoder:
     """FFmpeg's MJPEG encoder on YUV frames: several times faster than an RGB round trip through PIL."""
 
     def __init__(self):
         self._codec = None
         self._size = None
+        self._trim = PaddingTrim()
 
     def encode(self, frame):
         import av
 
+        frame = self._trim.apply(frame)
         fw, fh = frame.width, frame.height
         oh = min(MAX_HEIGHT, fh) // 2 * 2
         ow = max(2, round(oh * fw / fh) // 2 * 2)

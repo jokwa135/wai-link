@@ -233,7 +233,10 @@ public sealed class IphoneController : IDisposable
             _hidButtons.TryDequeue(out var pending))
             pending.Completion?.TrySetResult(line[14..] == pending.Button);
         if (line?.Contains("HID_BRIDGE_READY", StringComparison.OrdinalIgnoreCase) == true)
+        {
             _hidBridgeReady = true;
+            SendScreenPixels(); // a restarted bridge has not heard it yet
+        }
         if (line is not null &&
             (line.Contains("HID_BRIDGE_READY", StringComparison.OrdinalIgnoreCase) ||
              line.Contains("testCaseDidStart", StringComparison.OrdinalIgnoreCase) ||
@@ -818,7 +821,25 @@ public sealed class IphoneController : IDisposable
             }
         }
         catch { }
+        try
+        {
+            // The screen's pixel size lets the bridge cut the black padding the phone adds
+            // around its video frames (1242x2688 arrives as 1248x2704).
+            using var res = await _http.GetAsync($"{_wdaBaseUrl}/wda/screen", ct);
+            if (!res.IsSuccessStatusCode) return;
+            using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync(ct));
+            var val = doc.RootElement.GetProperty("value");
+            double scale = val.GetProperty("scale").GetDouble();
+            var size = val.GetProperty("screenSize");
+            int a = (int)Math.Round(size.GetProperty("width").GetDouble() * scale);
+            int b = (int)Math.Round(size.GetProperty("height").GetDouble() * scale);
+            if (a > 0 && b > 0) { _screenPixels = $"{Math.Min(a, b)} {Math.Max(a, b)}"; SendScreenPixels(); }
+        }
+        catch { }
     }
+
+    string? _screenPixels;
+    void SendScreenPixels() { if (_screenPixels is not null) TryWriteHidCommand("SCREEN " + _screenPixels); }
 
     /// <summary>
     /// Translates client panel coordinates (px, py) inside panelSize to iPhone logical point coordinates and taps.
