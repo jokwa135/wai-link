@@ -11,23 +11,24 @@ namespace PhoneBridge;
 public sealed partial class MainForm
 {
     const int StyleButtonId = 9;
+    const int CameraButtonId = 12;
     ShellFrameWindow? _frame;
     LayeredSurface? _shadow;
     Bitmap? _bodyLayer;
     Size _shadowSize;
     bool _bodyDirty = true, _frameDirty = true;
     UiAnimationClock _motionTimer = null!;
-    readonly float[] _glyphScale = Enumerable.Repeat(1f, 12).ToArray();
-    readonly float[] _glyphVelocity = new float[12];
-    readonly double[] _glyphError = Enumerable.Repeat(-10.0, 12).ToArray();
+    readonly float[] _glyphScale = Enumerable.Repeat(1f, 13).ToArray();
+    readonly float[] _glyphVelocity = new float[13];
+    readonly double[] _glyphError = Enumerable.Repeat(-10.0, 13).ToArray();
     readonly bool[] _keyOnLeft = new bool[4];
-    Rectangle _btnStyleRect;
+    Rectangle _btnStyleRect, _btnCameraRect;
     Bitmap? _homeLogo;
     double _motionLast;
     ViewportDissolve? _dissolve;
 
-    bool IsGlyphHover(int i) => i is < 6 or StyleButtonId or UnlockButtonId or RotateButtonId ? _hoverTopId == i : _hoverBotId == i - 6;
-    bool IsGlyphPressed(int i) => i is < 6 or StyleButtonId or UnlockButtonId or RotateButtonId ? _pressedTopId == i : _pressedBotId == i - 6;
+    bool IsGlyphHover(int i) => i is < 6 or StyleButtonId or UnlockButtonId or RotateButtonId or CameraButtonId ? _hoverTopId == i : _hoverBotId == i - 6;
+    bool IsGlyphPressed(int i) => i is < 6 or StyleButtonId or UnlockButtonId or RotateButtonId or CameraButtonId ? _pressedTopId == i : _pressedBotId == i - 6;
     Point FrameOrigin => new(Left - ShellRenderer.PadPx, Top - ShellRenderer.PadPx);
     Point ShadowOrigin => new(Left - ShellRenderer.ShadowPadPx, Top - ShellRenderer.ShadowPadPx);
 
@@ -206,7 +207,9 @@ public sealed partial class MainForm
         DrawBarGlyph(g, _btnStyleRect, StyleButtonId);
         _btnUnlockRect = iphone ? new Rectangle(w - 104, by, 22, 18) : Rectangle.Empty;
         if (iphone) DrawBarGlyph(g, _btnUnlockRect, UnlockButtonId);
-        _btnRotateRect = selected ? new Rectangle(w - (iphone ? 128 : 104), by, 22, 18) : Rectangle.Empty;
+        _btnCameraRect = iphone ? new Rectangle(w - 128, by, 22, 18) : Rectangle.Empty;
+        if (iphone) DrawBarGlyph(g, _btnCameraRect, CameraButtonId);
+        _btnRotateRect = selected ? new Rectangle(w - (iphone ? 152 : 104), by, 22, 18) : Rectangle.Empty;
         if (selected) DrawBarGlyph(g, _btnRotateRect, RotateButtonId);
         DrawBarGlyph(g, _btnMinRect, 4);
         DrawBarGlyph(g, _btnCloseRect, 5);
@@ -309,7 +312,7 @@ public sealed partial class MainForm
     void DrawBarGlyph(Graphics g, Rectangle rect, int id)
     {
         bool hover = IsGlyphHover(id), pressed = IsGlyphPressed(id);
-        bool top = id is 4 or 5 or StyleButtonId or UnlockButtonId or RotateButtonId;
+        bool top = id is 4 or 5 or StyleButtonId or UnlockButtonId or RotateButtonId or CameraButtonId;
         var ink = ShellStyle.Ink;
         var color = Color.FromArgb(top ? 215 : 225, ink);
         float cx = rect.X + rect.Width / 2f, cy = rect.Y + rect.Height / 2f;
@@ -347,6 +350,14 @@ public sealed partial class MainForm
                 g.DrawArc(pen, -2.8f, -5.5f, 5.6f, 7, 180, _unlockTaps.Count > 0 ? 180 : 150);
                 if (_unlockRecording)
                     using (var dot = new SolidBrush(Color.FromArgb(235, 255, 80, 96))) g.FillEllipse(dot, 3.2f, -6.8f, 3.6f, 3.6f);
+                break;
+            case CameraButtonId:
+                // Camera body and lens. Lit dot: live video is paused, so the phone's camera and Face ID work.
+                using (var body = ShellRenderer.Round(new RectangleF(-5.5f, -3, 11, 7.5f), 1.8f)) g.DrawPath(pen, body);
+                g.DrawLine(pen, -2, -3, -1, -4.6f); g.DrawLine(pen, -1, -4.6f, 1.6f, -4.6f); g.DrawLine(pen, 1.6f, -4.6f, 2.6f, -3);
+                g.DrawEllipse(pen, -1.9f, -1.1f, 3.8f, 3.8f);
+                if (_iphoneController.IsVideoPaused)
+                    using (var dot = new SolidBrush(Color.FromArgb(235, 70, 200, 110))) g.FillEllipse(dot, 3.6f, -7f, 3.6f, 3.6f);
                 break;
             case 4: g.DrawLine(pen, -4, 0, 4, 0); break;
             case 5: g.DrawLine(pen, -3.4f, -3.4f, 3.4f, 3.4f); g.DrawLine(pen, 3.4f, -3.4f, -3.4f, 3.4f); break;

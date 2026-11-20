@@ -123,6 +123,25 @@ public sealed class IphoneController : IDisposable
     volatile bool _hidContactReady;
     volatile bool _hidButtonAckReady;
     volatile bool _clipboardReady;
+    volatile bool _videoPaused;
+    readonly ManualResetEventSlim _videoLive = new(false);
+
+    /// <summary>
+    /// True while the iOS 27+ hardware screen stream is paused. iOS blocks the camera,
+    /// microphone and Face ID while that stream runs; pausing frees them and the mirror
+    /// falls back to WDA screenshots. Kept across bridge restarts.
+    /// </summary>
+    public bool IsVideoPaused => _videoPaused;
+
+    public void SetVideoPaused(bool paused)
+    {
+        _videoPaused = paused;
+        TryWriteHidCommand(paused ? "VIDEO_OFF" : "VIDEO_ON");
+    }
+
+    // After QUIT the bridge ends the screen stream first (HID_VIDEO_PAUSED). Wait for that
+    // before killing it, or the phone can stay "observed remotely" with its camera blocked.
+    void WaitForVideoStop() => SpinWait.SpinUntil(() => !_videoLive.IsSet || _wdaBridgeProcess is null or { HasExited: true }, 5000);
     string? _phoneClipboard;
     TaskCompletionSource<bool>? _clipboardRead;
     readonly SemaphoreSlim _clipboardReadLock = new(1, 1);
@@ -180,6 +199,9 @@ public sealed class IphoneController : IDisposable
     {
         if (line is not null) LogBridgeLine(line);
         if (line == "HID_CLIPBOARD_READY") _clipboardReady = true;
+        if (line == "HID_VIDEO_READY") _videoLive.Set();
+        if (line == "HID_VIDEO_PAUSED" || line == "HID_VIDEO_UNSUPPORTED" || line?.StartsWith("HID_VIDEO_FAILED", StringComparison.Ordinal) == true)
+            _videoLive.Reset();
         if (line == "HID_CLIPBOARD_EMPTY") _phoneClipboard = null;
         if (line?.StartsWith("HID_CLIPBOARD ", StringComparison.Ordinal) == true)
         {
@@ -292,6 +314,7 @@ public sealed class IphoneController : IDisposable
                                 _hidButtonAckReady = false;
                                 _hidContactReady = false;
                                 _clipboardReady = false;
+                                _videoLive.Reset();
                                 _clipboardRead?.TrySetResult(false);
                                 FailPendingHidButtons();
                                 lock (_hidWriteLock) { _wdaBridgeStdin = null; }
@@ -361,6 +384,7 @@ public sealed class IphoneController : IDisposable
         AppPaths.ApplyIphoneEnvironment(psi);
         if (!string.IsNullOrWhiteSpace(_lastKnownLanIp))
             psi.EnvironmentVariables["WDA_WIFI_HOST"] = _lastKnownLanIp;
+        if (_videoPaused) psi.EnvironmentVariables["WAILINK_VIDEO_PAUSED"] = "1";
         var proc = Process.Start(psi);
         if (proc is not null)
         {
@@ -1728,7 +1752,7 @@ public sealed class IphoneController : IDisposable
     public void StopBridge()
     {
         _bridgeWanted = false;
-        TryWriteHidCommand("QUIT");
+        if (TryWriteHidCommand("QUIT")) WaitForVideoStop();
         _hidBridgeReady = false;
         _hidButtonAckReady = false;
         _hidTouchReady = _hidContactReady = _clipboardReady = false;
@@ -1756,7 +1780,7 @@ public sealed class IphoneController : IDisposable
         _bridgeWanted = false;
         _wdaConnected = false;
 
-        TryWriteHidCommand("QUIT");
+        if (TryWriteHidCommand("QUIT")) WaitForVideoStop();
         lock (_hidWriteLock) { _wdaBridgeStdin = null; }
 
         try

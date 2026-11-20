@@ -813,6 +813,7 @@ public sealed partial class MainForm : Form
         if (_btnCloseRect.Contains(pt)) return 5;
         if (_btnStyleRect.Contains(pt)) return StyleButtonId;
         if (_btnUnlockRect.Contains(pt)) return UnlockButtonId;
+        if (_btnCameraRect.Contains(pt)) return CameraButtonId;
         if (_btnRotateRect.Contains(pt)) return RotateButtonId;
         return -1;
     }
@@ -932,6 +933,13 @@ public sealed partial class MainForm : Form
 
                 case UnlockButtonId: // iPhone unlock
                     ToggleUnlockPopup();
+                    return;
+
+                case CameraButtonId: // Pause live video so the iPhone's camera and Face ID work
+                    _iphoneController.SetVideoPaused(!_iphoneController.IsVideoPaused);
+                    _iphonePanel.ResetFastStreamRetry();
+                    ResetGlassSurface();
+                    Invalidate();
                     return;
 
                 case StyleButtonId: // Shell opacity and color

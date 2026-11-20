@@ -244,6 +244,14 @@ public sealed class IphoneChassisView : Panel
     long _fastPortCheckTick;
     bool _fastPortListening;
 
+    // Look for the hardware stream again right away (after live video is resumed).
+    public void ResetFastStreamRetry()
+    {
+        _fastRetryAfterTick = 0;
+        _fastFailures = 0;
+        _fastPortCheckTick = 0;
+    }
+
     bool FastStreamAvailable()
     {
         long now = Environment.TickCount64;

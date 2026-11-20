@@ -163,6 +163,16 @@ def supervised_input_loop(read_input):
                         # those samples do not belong to a continuous contact.
                         asyncio.run_coroutine_threadsafe(send_contact(parts[0], x, y), loop).result(4)
                         continue
+                    if line.strip() in ("VIDEO_OFF", "VIDEO_ON"):
+                        asyncio.run_coroutine_threadsafe(set_video(line.strip() == "VIDEO_ON"), loop)
+                        continue
+                    if line.strip() == "QUIT":
+                        # End the screen stream before the runner shuts down, so iOS
+                        # releases the camera and microphone even if the owner kills us soon after.
+                        try:
+                            asyncio.run_coroutine_threadsafe(set_video(False), loop).result(10)
+                        except Exception:
+                            pass
                     if line.strip() != "CLIP_GET":
                         return line
                     asyncio.run_coroutine_threadsafe(read_clipboard(), loop)
@@ -242,18 +252,46 @@ async def ensure_developer_image(rsd):
     bridge_lost("developer image mounted; reconnecting")
 
 
+# While the screen stream runs, iOS treats the phone as observed remotely and blocks
+# the camera and microphone (and with them Face ID). VIDEO_OFF ends the stream so they
+# work again; the owner falls back to WDA screenshots. WAILINK_VIDEO_PAUSED=1 starts paused.
+_video_rsd = None
+_video_task = None
+_video_lock = None
+
+
+async def set_video(on):
+    global _video_task, _video_lock
+    if _video_lock is None:
+        _video_lock = asyncio.Lock()
+    async with _video_lock:
+        task = _video_task
+        if on:
+            if _video_rsd is not None and (task is None or task.done()):
+                _video_task = asyncio.create_task(run_screen_video(_video_rsd))
+            print("HID_VIDEO_RESUMED", flush=True)
+        else:
+            _video_task = None
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            print("HID_VIDEO_PAUSED", flush=True)
+
+
 def tunnel_watched_run(original_run):
     async def run(self, cfg, *args, **kwargs):
+        global _video_rsd
         await ensure_developer_image(self.lockdown)
         tunnel = asyncio.create_task(watch_tunnel())
+        _video_rsd = self.lockdown
         # Start video before the runner launch, which can take 10+ seconds.
-        video = asyncio.create_task(run_screen_video(self.lockdown))
+        await set_video(os.environ.get("WAILINK_VIDEO_PAUSED") != "1")
         try:
             return await original_run(self, cfg, *args, **kwargs)
         finally:
             tunnel.cancel()
-            video.cancel()
-            await asyncio.gather(video, return_exceptions=True)
+            await set_video(False)
+            _video_rsd = None
 
     return run
 
