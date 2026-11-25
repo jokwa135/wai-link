@@ -17,6 +17,9 @@ class LayeredSurface : Form
     [DllImport("gdi32.dll")] static extern bool DeleteDC(nint dc);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(nint obj);
     [DllImport("user32.dll")] static extern bool SetWindowPos(nint window, nint after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern nint BeginDeferWindowPos(int count);
+    [DllImport("user32.dll")] static extern nint DeferWindowPos(nint hdwp, nint window, nint after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool EndDeferWindowPos(nint hdwp);
     [DllImport("user32.dll", SetLastError = true)] static extern bool UpdateLayeredWindow(
         nint window, nint screen, ref NativePoint position, ref NativeSize size,
         nint source, ref NativePoint sourcePosition, uint colorKey, ref Blend blend, uint flags);
@@ -66,6 +69,25 @@ class LayeredSurface : Form
     public void MoveTo(Point location)
     {
         if (!IsDisposed && IsHandleCreated) SetWindowPos(Handle, 0, location.X, location.Y, 0, 0, 0x0001 | 0x0004 | 0x0010);
+    }
+
+    public static void MoveTogether(LayeredSurface? first, Point firstLocation, LayeredSurface? second, Point secondLocation)
+    {
+        bool fOk = first is { IsDisposed: false, IsHandleCreated: true };
+        bool sOk = second is { IsDisposed: false, IsHandleCreated: true };
+        if (fOk && sOk)
+        {
+            const uint flags = 0x0001 | 0x0004 | 0x0010; // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            nint hdwp = BeginDeferWindowPos(2);
+            if (hdwp != 0)
+            {
+                hdwp = DeferWindowPos(hdwp, first!.Handle, 0, firstLocation.X, firstLocation.Y, 0, 0, flags);
+                if (hdwp != 0) hdwp = DeferWindowPos(hdwp, second!.Handle, 0, secondLocation.X, secondLocation.Y, 0, 0, flags);
+                if (hdwp != 0 && EndDeferWindowPos(hdwp)) return;
+            }
+        }
+        if (fOk) first!.MoveTo(firstLocation);
+        if (sOk) second!.MoveTo(secondLocation);
     }
 }
 

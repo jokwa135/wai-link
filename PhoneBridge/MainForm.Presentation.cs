@@ -15,8 +15,10 @@ public sealed partial class MainForm
     ShellFrameWindow? _frame;
     LayeredSurface? _shadow;
     Bitmap? _bodyLayer;
-    Size _shadowSize;
-    bool _bodyDirty = true, _frameDirty = true;
+    Size _shadowSize, _renderedSize, _sizeMoveStart;
+    bool _bodyDirty = true, _frameDirty = true, _bodyDraft, _inSizeMove;
+    ToolTip? _chromeTip;
+    string _chromeTipText = "";
     UiAnimationClock _motionTimer = null!;
     readonly float[] _glyphScale = Enumerable.Repeat(1f, 13).ToArray();
     readonly float[] _glyphVelocity = new float[13];
@@ -46,6 +48,7 @@ public sealed partial class MainForm
         ShellStyle.Changed += OnShellStyleChanged;
         _frame = new ShellFrameWindow(this);
         _shadow = new LayeredSurface(clickThrough: true);
+        _chromeTip = new ToolTip { InitialDelay = 350, AutoPopDelay = 6000, ReshowDelay = 120, ShowAlways = true };
         ApplyWindowRegion();
         _motionTimer = new UiAnimationClock(this);
         _motionTimer.Tick += (_, _) =>
@@ -71,10 +74,54 @@ public sealed partial class MainForm
     protected override void OnInvalidated(InvalidateEventArgs e) { base.OnInvalidated(e); _frameDirty = true; }
     protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); _frameDirty = true; if (!Visible) { _frame?.Hide(); _shadow?.Hide(); } }
 
+    void BeginSizeMove()
+    {
+        _inSizeMove = true;
+        _sizeMoveStart = Size;
+        _devicePopover.Dismiss();
+        _stylePopup.Dismiss();
+        _unlockPopup.Dismiss();
+    }
+
+    void EndSizeMove()
+    {
+        if (!_inSizeMove) return;
+        _inSizeMove = false;
+        _chooserPanel.SetLiveResize(false);
+        if (_bodyDraft || Size != _sizeMoveStart || _shadowSize != Size)
+        {
+            _bodyDirty = true;
+            _bodyDraft = false;
+            _shadowSize = Size.Empty;
+            RenderFrame();
+        }
+    }
+
+    void UpdateChromeTooltip(int topHover)
+    {
+        if (_chromeTip is null || _frame is null || _frame.IsDisposed) return;
+        string tip = topHover switch
+        {
+            CameraButtonId => _iphoneController.IsVideoPaused
+                ? "Camera mode on (60 FPS video paused) - click to resume"
+                : "Pause live video so iPhone Camera & Face ID work",
+            RotateButtonId => _landscape ? "Switch to portrait" : "Switch to landscape",
+            UnlockButtonId => "Auto-unlock passcode",
+            StyleButtonId => "Appearance & settings",
+            0 => "Switch device",
+            _ => ""
+        };
+        if (tip == _chromeTipText) return;
+        _chromeTipText = tip;
+        _chromeTip.SetToolTip(_frame, tip);
+    }
+
     void MoveShellSurfaces()
     {
-        _frame?.MoveTo(FrameOrigin);
-        _shadow?.MoveTo(ShadowOrigin);
+        // During a top/left drag-resize, LocationChanged can fire right before Resize; skip moving
+        // stale-sized surfaces so RenderFrame() updates position and size atomically instead.
+        if (!(_inSizeMove && Size != _renderedSize))
+            LayeredSurface.MoveTogether(_frame, FrameOrigin, _shadow is { Visible: true } ? _shadow : null, ShadowOrigin);
         _devicePopover.Dismiss();
         _stylePopup.Dismiss();
         _unlockPopup.Dismiss();
@@ -85,6 +132,7 @@ public sealed partial class MainForm
     {
         ShellStyle.Changed -= OnShellStyleChanged;
         _motionTimer?.Dispose();
+        _chromeTip?.Dispose(); _chromeTip = null;
         _devicePopover.Dispose();
         _stylePopup.Dispose();
         _typeBox.Dispose();
@@ -96,14 +144,15 @@ public sealed partial class MainForm
         _dissolve?.Dispose(); _dissolve = null;
     }
 
-    Bitmap ComposeFrame()
+    Bitmap ComposeFrame(bool fast = false)
     {
         int w = Width, h = Height, pad = ShellRenderer.PadPx;
-        if (_bodyLayer is null || _bodyDirty || _bodyLayer.Width != w + pad * 2 || _bodyLayer.Height != h + pad * 2)
+        if (_bodyLayer is null || _bodyDirty || (_bodyDraft && !fast) || _bodyLayer.Width != w + pad * 2 || _bodyLayer.Height != h + pad * 2)
         {
             _bodyLayer?.Dispose();
-            _bodyLayer = ShellRenderer.Body(new Size(w, h), _stage.Bounds);
+            _bodyLayer = ShellRenderer.Body(new Size(w, h), _stage.Bounds, fast);
             _bodyDirty = false;
+            _bodyDraft = fast;
         }
         var surface = _bodyLayer.Clone(new Rectangle(Point.Empty, _bodyLayer.Size), PixelFormat.Format32bppPArgb);
         using var g = Graphics.FromImage(surface);
@@ -118,15 +167,21 @@ public sealed partial class MainForm
         if (_closing || IsDisposed || _frame is null || _shadow is null) return;
         if (!Visible || WindowState == FormWindowState.Minimized || Width < 60 || Height < 60) return;
         _frameDirty = false;
-        using (var surface = ComposeFrame()) _frame.Present(surface, FrameOrigin);
-        if (_shadowSize != Size)
+        bool fastDrag = _inSizeMove && Size != _sizeMoveStart;
+        if (fastDrag && _shadow.Visible) _shadow.Hide();
+        using (var surface = ComposeFrame(fastDrag)) _frame.Present(surface, FrameOrigin);
+        _renderedSize = Size;
+        if (!fastDrag)
         {
-            using var shadow = ShellRenderer.Shadow(Size, ShellRenderer.OuterRadius, ShellRenderer.ShadowPadPx);
-            _shadow.Present(shadow, ShadowOrigin);
-            _shadowSize = Size;
+            if (_shadowSize != Size)
+            {
+                using var shadow = ShellRenderer.Shadow(Size, ShellRenderer.OuterRadius, ShellRenderer.ShadowPadPx);
+                _shadow.Present(shadow, ShadowOrigin);
+                _shadowSize = Size;
+            }
+            else _shadow.MoveTo(ShadowOrigin);
+            if (!_shadow.Visible) _shadow.Show(this);
         }
-        else _shadow.MoveTo(ShadowOrigin);
-        if (!_shadow.Visible) _shadow.Show(this);
         if (!_frame.Visible) _frame.Show(this);
     }
 
@@ -207,9 +262,11 @@ public sealed partial class MainForm
         DrawBarGlyph(g, _btnStyleRect, StyleButtonId);
         _btnUnlockRect = iphone ? new Rectangle(w - 104, by, 22, 18) : Rectangle.Empty;
         if (iphone) DrawBarGlyph(g, _btnUnlockRect, UnlockButtonId);
-        _btnCameraRect = iphone ? new Rectangle(w - 128, by, 22, 18) : Rectangle.Empty;
+        bool camPaused = iphone && _iphoneController.IsVideoPaused;
+        int camW = camPaused && w >= 330 ? 52 : 22;
+        _btnCameraRect = iphone ? new Rectangle(w - 106 - camW, by, camW, 18) : Rectangle.Empty;
         if (iphone) DrawBarGlyph(g, _btnCameraRect, CameraButtonId);
-        _btnRotateRect = selected ? new Rectangle(w - (iphone ? 152 : 104), by, 22, 18) : Rectangle.Empty;
+        _btnRotateRect = selected ? new Rectangle(w - (iphone ? 130 + camW : 104), by, 22, 18) : Rectangle.Empty;
         if (selected) DrawBarGlyph(g, _btnRotateRect, RotateButtonId);
         DrawBarGlyph(g, _btnMinRect, 4);
         DrawBarGlyph(g, _btnCloseRect, 5);
@@ -313,10 +370,21 @@ public sealed partial class MainForm
     {
         bool hover = IsGlyphHover(id), pressed = IsGlyphPressed(id);
         bool top = id is 4 or 5 or StyleButtonId or UnlockButtonId or RotateButtonId or CameraButtonId;
+        bool camActive = id == CameraButtonId && _iphoneController.IsVideoPaused;
         var ink = ShellStyle.Ink;
-        var color = Color.FromArgb(top ? 215 : 225, ink);
+        var color = camActive
+            ? (ShellStyle.IsLight ? Color.FromArgb(14, 128, 70) : Color.FromArgb(115, 242, 168))
+            : Color.FromArgb(top ? 215 : 225, ink);
         float cx = rect.X + rect.Width / 2f, cy = rect.Y + rect.Height / 2f;
-        if (hover || pressed)
+        if (camActive)
+        {
+            using var shape = ShellRenderer.Round(rect, 9);
+            using var fill = new SolidBrush(Color.FromArgb(pressed ? 95 : hover ? 76 : 54, 52, 211, 153));
+            g.FillPath(fill, shape);
+            using var border = new Pen(Color.FromArgb(185, 70, 215, 130), 1f);
+            g.DrawPath(border, shape);
+        }
+        else if (hover || pressed)
         {
             RectangleF plate = top ? rect : new RectangleF(cx - 24, cy - 12, 48, 24);
             using var shape = ShellRenderer.Round(plate, top ? 7 : 12);
@@ -352,12 +420,26 @@ public sealed partial class MainForm
                     using (var dot = new SolidBrush(Color.FromArgb(235, 255, 80, 96))) g.FillEllipse(dot, 3.2f, -6.8f, 3.6f, 3.6f);
                 break;
             case CameraButtonId:
-                // Camera body and lens. Lit dot: live video is paused, so the phone's camera and Face ID work.
-                using (var body = ShellRenderer.Round(new RectangleF(-5.5f, -3, 11, 7.5f), 1.8f)) g.DrawPath(pen, body);
-                g.DrawLine(pen, -2, -3, -1, -4.6f); g.DrawLine(pen, -1, -4.6f, 1.6f, -4.6f); g.DrawLine(pen, 1.6f, -4.6f, 2.6f, -3);
-                g.DrawEllipse(pen, -1.9f, -1.1f, 3.8f, 3.8f);
-                if (_iphoneController.IsVideoPaused)
-                    using (var dot = new SolidBrush(Color.FromArgb(235, 70, 200, 110))) g.FillEllipse(dot, 3.6f, -7f, 3.6f, 3.6f);
+                // Camera body and lens. Green pill + CAM badge when live video is paused for Camera/Face ID.
+                if (camActive && rect.Width > 30)
+                {
+                    g.TranslateTransform(-14f, 0);
+                    using (var body = ShellRenderer.Round(new RectangleF(-5f, -2.8f, 10, 7f), 1.7f)) g.DrawPath(pen, body);
+                    g.DrawLine(pen, -1.8f, -2.8f, -.9f, -4.3f); g.DrawLine(pen, -.9f, -4.3f, 1.4f, -4.3f); g.DrawLine(pen, 1.4f, -4.3f, 2.3f, -2.8f);
+                    g.DrawEllipse(pen, -1.7f, -1f, 3.4f, 3.4f);
+                    using var font = Theme.Font(6.8f, FontStyle.Bold);
+                    using var labelBrush = new SolidBrush(color);
+                    using var fmt = new StringFormat(StringFormat.GenericTypographic) { LineAlignment = StringAlignment.Center };
+                    g.DrawString("CAM", font, labelBrush, new RectangleF(8f, -7.5f, 30f, 15.5f), fmt);
+                }
+                else
+                {
+                    using (var body = ShellRenderer.Round(new RectangleF(-5.5f, -3, 11, 7.5f), 1.8f)) g.DrawPath(pen, body);
+                    g.DrawLine(pen, -2, -3, -1, -4.6f); g.DrawLine(pen, -1, -4.6f, 1.6f, -4.6f); g.DrawLine(pen, 1.6f, -4.6f, 2.6f, -3);
+                    g.DrawEllipse(pen, -1.9f, -1.1f, 3.8f, 3.8f);
+                    if (camActive)
+                        using (var dot = new SolidBrush(Color.FromArgb(245, 70, 220, 125))) g.FillEllipse(dot, 3.6f, -7f, 3.8f, 3.8f);
+                }
                 break;
             case 4: g.DrawLine(pen, -4, 0, 4, 0); break;
             case 5: g.DrawLine(pen, -3.4f, -3.4f, 3.4f, 3.4f); g.DrawLine(pen, 3.4f, -3.4f, -3.4f, 3.4f); break;

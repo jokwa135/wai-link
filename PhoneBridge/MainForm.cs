@@ -339,16 +339,17 @@ public sealed partial class MainForm : Form
 
         Resize += (_, _) =>
         {
-            ResetGlassSurface();
-            ApplyWindowRegion();
             LayoutViewport();
-            Invalidate();
+            if (_inSizeMove && Size != _sizeMoveStart) _chooserPanel.SetLiveResize(true);
+            RenderFrame();
         };
         LocationChanged += (_, _) => MoveShellSurfaces();
     }
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == 0x0231) BeginSizeMove(); // WM_ENTERSIZEMOVE
+        else if (m.Msg == 0x0232) EndSizeMove(); // WM_EXITSIZEMOVE
         if (m.Msg == 0x0214) // WM_SIZING: preserve the opposite edge/corner as anchor.
         {
             var rect = Marshal.PtrToStructure<SizingRect>(m.LParam);
@@ -859,12 +860,14 @@ public sealed partial class MainForm : Form
         {
             _hoverTopId = topHover;
             _hoverBotId = botHover;
+            UpdateChromeTooltip(topHover);
             Invalidate();
         }
     }
 
     internal void ChromeMouseLeave()
     {
+        UpdateChromeTooltip(-1);
         if (_hoverTopId != -1 || _hoverBotId != -1 || _pressedTopId != -1 || _pressedBotId != -1)
         {
             _hoverTopId = -1;
@@ -938,6 +941,8 @@ public sealed partial class MainForm : Form
                 case CameraButtonId: // Pause live video so the iPhone's camera and Face ID work
                     _iphoneController.SetVideoPaused(!_iphoneController.IsVideoPaused);
                     _iphonePanel.ResetFastStreamRetry();
+                    UpdatePhoneAudio();
+                    UpdateChromeTooltip(_hoverTopId);
                     ResetGlassSurface();
                     Invalidate();
                     return;

@@ -65,9 +65,39 @@ def _annexb(au):
     return bytes(out)
 
 
-def _content_crop(frame):
+def _has_gray_padding(frame, cw=None, ch=None):
+    """Fast zero-copy check on the Y/U/V planes for the flat gray (128) margin the phone
+    leaves around a shrunk frame during fast motion. Avoids an RGB/PIL conversion on every
+    normal frame."""
+    fw = cw or frame.width
+    fh = ch or frame.height
+    if fw < 64 or fh < 64 or len(frame.planes) < 3:
+        return True
+    y_plane, u_plane, v_plane = frame.planes[0], frame.planes[1], frame.planes[2]
+    y_buf, u_buf, v_buf = memoryview(y_plane), memoryview(u_plane), memoryview(v_plane)
+    y_line, u_line, v_line = y_plane.line_size, u_plane.line_size, v_plane.line_size
+    if u_line < fw // 2 or v_line < fw // 2:
+        return True
+    rx = int(fw * 0.96)
+    by = int(fh * 0.96)
+    samples = (
+        (rx, fh // 4), (rx, fh // 2), (rx, fh * 3 // 4), (rx, by),
+        (fw // 4, by), (fw // 2, by), (fw * 3 // 4, by),
+    )
+    for x, y in samples:
+        yv = y_buf[y * y_line + x]
+        uv = u_buf[(y >> 1) * u_line + (x >> 1)]
+        vv = v_buf[(y >> 1) * v_line + (x >> 1)]
+        if not (118 <= yv <= 138 and 120 <= uv <= 136 and 120 <= vv <= 136):
+            return False
+    return True
+
+
+def _content_crop(frame, cw=None, ch=None):
     """Under fast motion the phone encodes a shrunk screen into the top-left corner
     with flat gray (128) padding. Return the content box to stretch back, or None."""
+    if not _has_gray_padding(frame, cw, ch):
+        return None
     from PIL import Image, ImageChops
 
     fw, fh = frame.width, frame.height
@@ -97,7 +127,6 @@ class PaddingTrim:
     def __init__(self):
         self._size = None  # coded frame size the decision below belongs to
         self._box = None   # (width, height) to keep, once decided
-        self._graph = None
         self._screen = None  # WAILINK_SCREEN_PX the decision was made with
 
     @classmethod
@@ -135,7 +164,7 @@ class PaddingTrim:
 
     def _decide(self, frame):
         plane = frame.planes[0]
-        y, line = bytes(plane), plane.line_size
+        y, line = memoryview(plane), plane.line_size
         fw, fh = frame.width, frame.height
         rows = range(fh // 40, fh - fh // 40, max(1, fh // 64))
         cols = range(fw // 40, fw - fw // 40, max(1, fw // 64))
@@ -145,35 +174,17 @@ class PaddingTrim:
             return None
         return (fw - right) // 2 * 2, (fh - bottom) // 2 * 2
 
-    def apply(self, frame):
-        from fractions import Fraction
-        import av
-
+    def box_for(self, frame):
+        """Return (width, height) to keep from the top-left of frame."""
         import os
 
         size = (frame.width, frame.height, frame.format.name)
         screen = os.environ.get("WAILINK_SCREEN_PX")
         if size != self._size or screen != self._screen:
-            self._size, self._screen, self._box, self._graph = size, screen, None, None
+            self._size, self._screen, self._box = size, screen, None
         if self._box is None:
             self._box = self._known(frame) or self._decide(frame)
-            if self._box is None:
-                return frame  # decide on a later frame
-        if self._box == (frame.width, frame.height):
-            return frame
-        if self._graph is None:
-            graph = av.filter.Graph()
-            source = graph.add_buffer(width=frame.width, height=frame.height,
-                                      format=frame.format.name, time_base=Fraction(1, 1000))
-            crop = graph.add("crop", "%d:%d:0:0" % self._box)
-            sink = graph.add("buffersink")
-            source.link_to(crop)
-            crop.link_to(sink)
-            graph.configure()
-            self._graph = graph
-        frame.pts = None
-        self._graph.vpush(frame)
-        return self._graph.vpull()
+        return self._box or (frame.width, frame.height)
 
 
 class JpegEncoder:
@@ -183,21 +194,43 @@ class JpegEncoder:
         self._codec = None
         self._size = None
         self._trim = PaddingTrim()
+        self._graph = None
+        self._graph_key = None
+
+    def _prep(self, frame, crop_w, crop_h, ow, oh):
+        """Crop padding (if any), downscale, and convert to yuvj420p in one persistent
+        FFmpeg filter graph so swscale contexts are reused across frames."""
+        import av
+
+        key = (frame.width, frame.height, frame.format.name, crop_w, crop_h, ow, oh)
+        if self._graph is None or self._graph_key != key:
+            graph = av.filter.Graph()
+            node = graph.add_buffer(
+                width=frame.width, height=frame.height,
+                format=frame.format.name, time_base=Fraction(1, 1000),
+            )
+            if (crop_w, crop_h) != (frame.width, frame.height):
+                crop = graph.add("crop", f"{crop_w}:{crop_h}:0:0")
+                node.link_to(crop)
+                node = crop
+            scale = graph.add("scale", f"{ow}:{oh}:flags=fast_bilinear")
+            node.link_to(scale)
+            fmt = graph.add("format", "pix_fmts=yuvj420p")
+            scale.link_to(fmt)
+            sink = graph.add("buffersink")
+            fmt.link_to(sink)
+            graph.configure()
+            self._graph, self._graph_key = graph, key
+        frame.pts = None
+        self._graph.vpush(frame)
+        return self._graph.vpull()
 
     def encode(self, frame):
         import av
 
-        frame = self._trim.apply(frame)
-        fw, fh = frame.width, frame.height
-        oh = min(MAX_HEIGHT, fh) // 2 * 2
-        ow = max(2, round(oh * fw / fh) // 2 * 2)
-        crop = _content_crop(frame)
-        if crop:
-            from PIL import Image
-
-            # Rare (fast motion only): stretch the shrunk corner back to full size.
-            image = frame.to_image().crop(crop).resize((ow, oh), Image.BILINEAR)
-            frame = av.VideoFrame.from_image(image)
+        cw, ch = self._trim.box_for(frame)
+        oh = min(MAX_HEIGHT, ch) // 2 * 2
+        ow = max(2, round(oh * cw / ch) // 2 * 2)
         if self._codec is None or self._size != (ow, oh):
             codec = av.CodecContext.create("mjpeg", "w")
             codec.width, codec.height = ow, oh
@@ -206,7 +239,15 @@ class JpegEncoder:
             codec.options = {"qmin": str(JPEG_QSCALE), "qmax": str(JPEG_QSCALE)}
             codec.open()
             self._codec, self._size = codec, (ow, oh)
-        scaled = frame.reformat(width=ow, height=oh, format="yuvj420p", interpolation="BILINEAR")
+        crop = _content_crop(frame, cw, ch)
+        if crop:
+            # Rare (fast motion only): stretch the shrunk corner back to full size.
+            from PIL import Image
+
+            image = frame.to_image().crop(crop).resize((ow, oh), Image.BILINEAR)
+            scaled = av.VideoFrame.from_image(image).reformat(width=ow, height=oh, format="yuvj420p")
+        else:
+            scaled = self._prep(frame, cw, ch, ow, oh)
         return b"".join(bytes(packet) for packet in self._codec.encode(scaled))
 
 

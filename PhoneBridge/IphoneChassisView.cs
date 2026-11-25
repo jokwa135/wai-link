@@ -639,8 +639,9 @@ public sealed class IphoneChassisView : Panel
                 g.CompositingMode = CompositingMode.SourceOver;
                 g.Clear(Color.Black);
                 var screen = ScreenBounds;
-                g.InterpolationMode = InterpolationMode.NearestNeighbor;
-                g.PixelOffsetMode = PixelOffsetMode.None;
+                bool exact = _currentFrame.Width == screen.Width && _currentFrame.Height == screen.Height;
+                g.InterpolationMode = exact ? InterpolationMode.NearestNeighbor : InterpolationMode.Bilinear;
+                g.PixelOffsetMode = exact ? PixelOffsetMode.None : PixelOffsetMode.Half;
                 g.SmoothingMode = SmoothingMode.None;
                 if (reveal < 1)
                 {

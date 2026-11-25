@@ -255,7 +255,23 @@ sealed class GlassDeviceChooser : Panel
 
     PointF Logical(Point p) => new(p.X / Dpi, p.Y / Dpi);
     int CardAt(Point p) { var l = Logical(p); return Array.FindIndex(_choices, r => r.Contains(l)); }
-    protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); _backdrop?.Dispose(); _backdrop = null; }
+    bool _liveResize;
+    public void SetLiveResize(bool active)
+    {
+        if (_liveResize == active) return;
+        _liveResize = active;
+        if (!active && _backdrop is not null && (_backdrop.Width != Width || _backdrop.Height != Height))
+        {
+            _backdrop.Dispose();
+            _backdrop = null;
+            Invalidate();
+        }
+    }
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        if (!_liveResize) { _backdrop?.Dispose(); _backdrop = null; }
+    }
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
@@ -379,7 +395,13 @@ sealed class GlassDeviceChooser : Panel
         if (Width < 40 || Height < 40) return;
         _backdrop ??= BuildBackdrop();
         var g = e.Graphics;
-        g.DrawImageUnscaled(_backdrop, 0, 0);
+        if (_backdrop.Width == Width && _backdrop.Height == Height)
+            g.DrawImageUnscaled(_backdrop, 0, 0);
+        else
+        {
+            g.InterpolationMode = InterpolationMode.Bilinear;
+            g.DrawImage(_backdrop, ClientRectangle);
+        }
         g.ScaleTransform(Dpi, Dpi);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;

@@ -35,7 +35,7 @@ public sealed partial class MainForm
     {
         bool want = !_closing && _viewMode == StudioViewMode.IphoneOnly && ShellStyle.PhoneSound;
         // iOS 27+: the phone's own sound arrives with the screen stream (in sync, no Bluetooth needed).
-        if (want && (_mirrorSound is not null || PhoneSoundPlayer.Available()))
+        if (want && !_iphoneController.IsVideoPaused && PhoneSoundPlayer.Available())
         {
             StopPhoneAudio();
             _mirrorSound ??= new PhoneSoundPlayer();

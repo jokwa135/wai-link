@@ -182,14 +182,14 @@ static class ShellRenderer
 
     // The chassis without controls: glass body with the screen cut out and a
     // thin opaque bezel that hides the viewport window's binary region edge.
-    public static Bitmap Body(Size size, Rectangle stage)
+    public static Bitmap Body(Size size, Rectangle stage, bool fast = false)
     {
-        const int scale = 2;
+        int scale = fast ? 1 : 2;
         int width = size.Width + PadPx * 2, height = size.Height + PadPx * 2;
-        using var big = new Bitmap(width * scale, height * scale, PixelFormat.Format32bppPArgb);
-        using (var g = Graphics.FromImage(big))
+        var canvas = new Bitmap(width * scale, height * scale, PixelFormat.Format32bppPArgb);
+        using (var g = Graphics.FromImage(canvas))
         {
-            g.ScaleTransform(scale, scale);
+            if (scale > 1) g.ScaleTransform(scale, scale);
             g.TranslateTransform(PadPx, PadPx);
             g.ScaleTransform(Scale, Scale);
             Panel(g, new RectangleF(0, 0, size.Width / Scale, size.Height / Scale), OuterRadius, ShellStyle.Opacity);
@@ -208,7 +208,8 @@ static class ShellRenderer
             using (var lip = Round(RectangleF.Inflate(screen, 2f, 2f), StageRadius + 2f))
             using (var pen = new Pen(Color.FromArgb(ShellStyle.IsLight ? 90 : 26, Color.White), .75f)) g.DrawPath(pen, lip);
         }
-        return Downsample(big, width, height);
+        if (fast) return canvas;
+        using (canvas) return Downsample(canvas, width, height);
     }
 
     // Two-layer soft shadow (tight contact + wide ambient) with the body cut out.
