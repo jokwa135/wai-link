@@ -413,7 +413,63 @@ async def _revive(server, screen_stream):
             server._consecutive_restarts = 0
 
 
+_active_server = None
+_kb_lock = None
+
+
+async def send_text(text: str) -> bool:
+    """Type ASCII / editing keys through the active ScreenStreamServer's persistent
+    CoreDevice virtual HID keyboard. Keeping one virtual keyboard attached prevents
+    iOS from popping the on-screen keyboard open and shut between WDA /wda/keys calls."""
+    from pymobiledevice3.remote.core_device.hid_service import (
+        ASCII_TO_HID,
+        KEY_BACKSPACE,
+        KEY_ENTER,
+        KEY_ESC,
+        KEY_LEFT_SHIFT,
+    )
+
+    server = _active_server
+    if server is None or not text:
+        return False
+    extra = {chr(8): (KEY_BACKSPACE, False), chr(13): (KEY_ENTER, False), chr(27): (KEY_ESC, False)}
+    steps = []
+    for ch in text:
+        mapping = ASCII_TO_HID.get(ch) or extra.get(ch)
+        if mapping is None:
+            return False
+        steps.append(mapping)
+    global _kb_lock
+    if _kb_lock is None:
+        _kb_lock = asyncio.Lock()
+    async with _kb_lock:
+        if _active_server is not server:
+            return False
+        try:
+            await asyncio.wait_for(server._ensure_keyboard(), 3.0)
+            uhs, kb_id = server._uhs, server._kb_service_id
+            if uhs is None or kb_id is None:
+                return False
+            for usage, needs_shift in steps:
+                if needs_shift:
+                    await uhs.send_keyboard(kb_id, (KEY_LEFT_SHIFT,))
+                    await asyncio.sleep(0.015)
+                    await uhs.send_keyboard(kb_id, (KEY_LEFT_SHIFT, usage))
+                    await asyncio.sleep(0.020)
+                else:
+                    await uhs.send_keyboard(kb_id, (usage,))
+                    await asyncio.sleep(0.015)
+                await uhs.send_keyboard(kb_id, ())
+                await asyncio.sleep(0.010)
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                await server._stop_hid()
+            return False
+
+
 async def _stream_once(rsd, screen_stream):
+    global _active_server
     from pymobiledevice3.remote.core_device.display_service import DisplayService
 
     loop = asyncio.get_running_loop()
@@ -428,6 +484,7 @@ async def _stream_once(rsd, screen_stream):
     listener = audio_listener = None
     try:
         await asyncio.wait_for(server._ensure_fresh_stream(), 15)
+        _active_server = server
         state.mark_needs_key(loop.time())
         state.reset_on_key = True
         server._subscribers[aus] = state
@@ -453,12 +510,18 @@ async def _stream_once(rsd, screen_stream):
                 state.mark_needs_key(loop.time())
                 server._request_recovery_idr(reason="decoder-behind")
     finally:
+        if _active_server is server:
+            _active_server = None
         server._subscribers.pop(aus, None)
         for task in tasks:
             task.cancel()
         for server_socket in (listener, audio_listener):
             if server_socket is not None:
                 server_socket.close()
+        if getattr(server, "_hid_worker_task", None) is not None:
+            server._hid_worker_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(server._stop_hid(), 3)
         with contextlib.suppress(BaseException):
             await asyncio.wait_for(server._stop_audio_stream(), 3)
         with contextlib.suppress(Exception):

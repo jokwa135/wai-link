@@ -163,6 +163,18 @@ def supervised_input_loop(read_input):
                         # those samples do not belong to a continuous contact.
                         asyncio.run_coroutine_threadsafe(send_contact(parts[0], x, y), loop).result(4)
                         continue
+                    if len(parts) == 2 and parts[0] == "KEY_TEXT":
+                        try:
+                            text = base64.b64decode(parts[1]).decode("utf-8")
+                            ok = (
+                                _video_module is not None
+                                and hasattr(_video_module, "send_text")
+                                and bool(asyncio.run_coroutine_threadsafe(_video_module.send_text(text), loop).result(8))
+                            )
+                        except Exception:
+                            ok = False
+                        print("HID_KEY_OK" if ok else "HID_KEY_FAILED", flush=True)
+                        continue
                     if len(parts) == 3 and parts[0] == "SCREEN":
                         # Screen size in pixels, read by wda_video to trim frame padding.
                         os.environ["WAILINK_SCREEN_PX"] = parts[1] + "x" + parts[2]
@@ -223,6 +235,7 @@ async def watch_tunnel():
 async def run_screen_video(rsd):
     """Hardware screen video (iOS 27+) from wda_video.py beside this file, if present.
     It must run in this process: iOS ends a second process's screen stream."""
+    global _video_module
     import importlib.util
 
     path = Path(__file__).with_name("wda_video.py")
@@ -235,7 +248,15 @@ async def run_screen_video(rsd):
     except Exception as error:
         print("HID_VIDEO_FAILED " + type(error).__name__, flush=True)
         return
-    await module.run_video(rsd)
+    _video_module = module
+    try:
+        await module.run_video(rsd)
+    finally:
+        if _video_module is module:
+            _video_module = None
+
+
+_video_module = None
 
 
 async def ensure_developer_image(rsd):

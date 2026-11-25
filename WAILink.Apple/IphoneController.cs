@@ -121,6 +121,9 @@ public sealed class IphoneController : IDisposable
     volatile bool _hidBridgeReady;
     volatile bool _hidTouchReady;
     volatile bool _hidContactReady;
+    volatile bool _hidVideoReady;
+    readonly SemaphoreSlim _hidKeyLock = new(1, 1);
+    TaskCompletionSource<bool>? _hidKeyAck;
     volatile bool _hidButtonAckReady;
     volatile bool _clipboardReady;
     volatile bool _videoPaused;
@@ -214,11 +217,18 @@ public sealed class IphoneController : IDisposable
         }
         if (line == "HID_CLIPBOARD_READ_OK") _clipboardRead?.TrySetResult(true);
         if (line == "HID_CLIPBOARD_READ_FAILED") _clipboardRead?.TrySetResult(false);
+        if (line == "HID_KEY_OK") _hidKeyAck?.TrySetResult(true);
+        if (line == "HID_KEY_FAILED") _hidKeyAck?.TrySetResult(false);
+        if (line == "HID_VIDEO_READY") _hidVideoReady = true;
+        if (line == "HID_VIDEO_PAUSED" || line?.StartsWith("HID_VIDEO_FAILED", StringComparison.Ordinal) == true)
+            _hidVideoReady = false;
         if (line == "HID_BRIDGE_LOST")
         {
             _clipboardReady = false;
             _clipboardRead?.TrySetResult(false);
+            _hidKeyAck?.TrySetResult(false);
             _hidBridgeReady = false;
+            _hidVideoReady = false;
             _hidTouchReady = false;
             _hidButtonAckReady = false;
             _hidContactReady = false;
@@ -279,9 +289,11 @@ public sealed class IphoneController : IDisposable
                     LogBridgeLine("[WAI Link] starting WDA bridge");
                     _wdaRunnerReady.Reset();
                     _hidBridgeReady = false;
+                    _hidVideoReady = false;
                     _hidTouchReady = false;
                     _hidButtonAckReady = false;
                     _hidContactReady = false;
+                    _hidKeyAck?.TrySetResult(false);
                     FailPendingHidButtons();
                     var bridgeProc = StartBackgroundPmd3(
                         pyExe,
@@ -313,12 +325,14 @@ public sealed class IphoneController : IDisposable
                             {
                                 try { LogBridgeLine($"[WAI Link] WDA bridge exited (code {bridgeProc.ExitCode})"); } catch { LogBridgeLine("[WAI Link] WDA bridge exited"); }
                                 _hidBridgeReady = false;
+                                _hidVideoReady = false;
                                 _hidTouchReady = false;
                                 _hidButtonAckReady = false;
                                 _hidContactReady = false;
                                 _clipboardReady = false;
                                 _videoLive.Reset();
                                 _clipboardRead?.TrySetResult(false);
+                                _hidKeyAck?.TrySetResult(false);
                                 FailPendingHidButtons();
                                 lock (_hidWriteLock) { _wdaBridgeStdin = null; }
                                 _wdaRunnerReady.Set();
@@ -1355,14 +1369,18 @@ public sealed class IphoneController : IDisposable
                     }
                 }
 
-                var chars = batch.Select(c => c.ToString()).ToArray();
-                var body = JsonSerializer.Serialize(new { value = chars });
-                lastOk = await PostKeysAsync(body, ct);
-                // WDA can restart on the phone and drop its session while the
-                // video stream keeps running, so the stream-based health check
-                // never notices. Re-establish the session and retry once.
-                if (!lastOk && await EnsureSessionHealthyAsync(ct))
+                lastOk = await TrySendHidKeysAsync(batch, ct);
+                if (!lastOk)
+                {
+                    var chars = batch.Select(c => c.ToString()).ToArray();
+                    var body = JsonSerializer.Serialize(new { value = chars });
                     lastOk = await PostKeysAsync(body, ct);
+                    // WDA can restart on the phone and drop its session while the
+                    // video stream keeps running, so the stream-based health check
+                    // never notices. Re-establish the session and retry once.
+                    if (!lastOk && await EnsureSessionHealthyAsync(ct))
+                        lastOk = await PostKeysAsync(body, ct);
+                }
             }
             catch
             {
@@ -1374,6 +1392,33 @@ public sealed class IphoneController : IDisposable
             }
         }
         return lastOk;
+    }
+
+    static bool CanSendViaHidKeyboard(string text)
+    {
+        if (text.Length is 0 or > 128) return false;
+        foreach (char c in text)
+        {
+            bool ok = (c >= ' ' && c <= '~') || c is '\b' or '\n' or '\r' or '\t';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    async Task<bool> TrySendHidKeysAsync(string text, CancellationToken ct)
+    {
+        if (!_hidBridgeReady || !_hidVideoReady || _videoPaused || !CanSendViaHidKeyboard(text))
+            return false;
+        await _hidKeyLock.WaitAsync(ct);
+        try
+        {
+            _hidKeyAck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
+            if (!TryWriteHidCommand("KEY_TEXT " + b64)) return false;
+            return await _hidKeyAck.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+        }
+        catch (TimeoutException) { return false; }
+        finally { _hidKeyAck = null; _hidKeyLock.Release(); }
     }
 
     public async Task<bool> SendBackspaceAsync(CancellationToken ct = default)
@@ -1775,9 +1820,11 @@ public sealed class IphoneController : IDisposable
         _bridgeWanted = false;
         if (TryWriteHidCommand("QUIT")) WaitForVideoStop();
         _hidBridgeReady = false;
+        _hidVideoReady = false;
         _hidButtonAckReady = false;
         _hidTouchReady = _hidContactReady = _clipboardReady = false;
         _clipboardRead?.TrySetResult(false);
+        _hidKeyAck?.TrySetResult(false);
         FailPendingHidButtons();
         lock (_bridgeProcessLock)
         {
